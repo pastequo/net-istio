@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	istiov1beta1 "istio.io/api/networking/v1beta1"
@@ -681,7 +682,7 @@ func TestMakeWildcardGateways(t *testing.T) {
 			},
 		})
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := MakeWildcardTLSGateways(ctx, tc.wildcardSecrets, svcLister)
+			got, err := MakeWildcardTLSGateways(ctx, &ingressResource, tc.wildcardSecrets, svcLister)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Test: %s; MakeWildcardGateways error = %v, WantErr %v", tc.name, err, tc.wantErr)
 			}
@@ -1022,5 +1023,79 @@ func TestGatewayNameLongIngressName(t *testing.T) {
 	got := GatewayName(ingress, svc)
 	if got != want {
 		t.Errorf("Unexpected gateway name. want %q, got %q", want, got)
+	}
+}
+
+func TestGetGatewaysFromAnnotations(t *testing.T) {
+	type Expectation struct {
+		Error  bool
+		Values sets.String
+	}
+
+	cases := []struct {
+		name          string
+		ingress       *v1alpha1.Ingress
+		wantForPublic Expectation
+		wantForLocal  Expectation
+	}{
+		{
+			name: "Happy path",
+			ingress: &v1alpha1.Ingress{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				PublicGatewayAnnotation: "ns1/gtw1",
+				LocalGatewaysAnnotation: "ns1/gtw2,ns2/gtw3",
+			}}},
+			wantForPublic: Expectation{Values: sets.NewString("ns1/gtw1")},
+			wantForLocal:  Expectation{Values: sets.NewString("ns1/gtw2", "ns2/gtw3")},
+		},
+		{
+			name:          "No annotation",
+			ingress:       &v1alpha1.Ingress{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}},
+			wantForPublic: Expectation{Values: sets.NewString()},
+			wantForLocal:  Expectation{Values: sets.NewString()},
+		},
+		{
+			name: "Invalid annotation",
+			ingress: &v1alpha1.Ingress{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				PublicGatewayAnnotation: "ns1.gtw1",
+				LocalGatewaysAnnotation: "ns1/gtw2,ns2.gtw3",
+			}}},
+			wantForPublic: Expectation{Error: true},
+			wantForLocal:  Expectation{Error: true},
+		},
+		{
+			name: "Annotation with spaces",
+			ingress: &v1alpha1.Ingress{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				PublicGatewayAnnotation: "  ns1/gtw1 ",
+				LocalGatewaysAnnotation: "ns1/gtw2  ,  ns2/gtw3 ",
+			}}},
+			wantForPublic: Expectation{Values: sets.NewString("ns1/gtw1")},
+			wantForLocal:  Expectation{Values: sets.NewString("ns1/gtw2", "ns2/gtw3")},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotPublic, err := GetGatewaysFromAnnotations(c.ingress, v1alpha1.IngressVisibilityExternalIP)
+			if (err != nil) != c.wantForPublic.Error {
+				t.Errorf("Expecting error for public: %v, got error: %v", c.wantForPublic.Error, err)
+			}
+
+			if !c.wantForPublic.Error {
+				if diff := cmp.Diff(c.wantForPublic.Values, gotPublic); diff != "" {
+					t.Error("Unexpected public Gateways (-want, +got):", diff)
+				}
+			}
+
+			gotLocal, err := GetGatewaysFromAnnotations(c.ingress, v1alpha1.IngressVisibilityClusterLocal)
+			if (err != nil) != c.wantForLocal.Error {
+				t.Errorf("Expecting error for local: %v, got error: %v", c.wantForLocal.Error, err)
+			}
+
+			if !c.wantForLocal.Error {
+				if diff := cmp.Diff(c.wantForLocal.Values, gotLocal); diff != "" {
+					t.Error("Unexpected local Gateways (-want, +got):", diff)
+				}
+			}
+		})
 	}
 }

@@ -111,8 +111,13 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 	ing.Status.InitializeConditions()
 	logger.Infof("Reconciling ingress: %#v", ing)
 
+	defaultGateways, err := computeDefaultGateways(ctx, ing)
+	if err != nil {
+		return fmt.Errorf("failed to compute default gateways: %w", err)
+	}
+
 	gatewayNames := map[v1alpha1.IngressVisibility]sets.String{}
-	gatewayNames[v1alpha1.IngressVisibilityClusterLocal] = qualifiedGatewayNamesFromContext(ctx)[v1alpha1.IngressVisibilityClusterLocal]
+	gatewayNames[v1alpha1.IngressVisibilityClusterLocal] = defaultGateways[v1alpha1.IngressVisibilityClusterLocal]
 	gatewayNames[v1alpha1.IngressVisibilityExternalIP] = sets.String{}
 
 	ingressGateways := []*v1beta1.Gateway{}
@@ -151,7 +156,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 		// same wildcard host. We need to handle wildcard certificate specially because Istio does
 		// not fully support multiple TLS Servers (or Gateways) share the same certificate.
 		// https://istio.io/docs/ops/common-problems/network-issues/
-		desiredWildcardGateways, err := resources.MakeWildcardTLSGateways(ctx, wildcardSecrets, r.svcLister)
+		desiredWildcardGateways, err := resources.MakeWildcardTLSGateways(ctx, ing, wildcardSecrets, r.svcLister)
 		if err != nil {
 			return err
 		}
@@ -177,8 +182,7 @@ func (r *Reconciler) reconcileIngress(ctx context.Context, ing *v1alpha1.Ingress
 	} else {
 		// Otherwise, we fall back to the default global Gateways for HTTP behavior.
 		// We need this for the backward compatibility.
-		defaultGlobalHTTPGateways := qualifiedGatewayNamesFromContext(ctx)[v1alpha1.IngressVisibilityExternalIP]
-		gatewayNames[v1alpha1.IngressVisibilityExternalIP].Insert(defaultGlobalHTTPGateways.List()...)
+		gatewayNames[v1alpha1.IngressVisibilityExternalIP].Insert(defaultGateways[v1alpha1.IngressVisibilityExternalIP].List()...)
 	}
 
 	if err := r.reconcileIngressGateways(ctx, ingressGateways); err != nil {
@@ -504,4 +508,28 @@ func isIngressPublic(ing *v1alpha1.Ingress) bool {
 		}
 	}
 	return false
+}
+
+func computeDefaultGateways(ctx context.Context, ing *v1alpha1.Ingress) (map[v1alpha1.IngressVisibility]sets.String, error) {
+	ret := qualifiedGatewayNamesFromContext(ctx) // gateways from config
+
+	for _, visibility := range []v1alpha1.IngressVisibility{v1alpha1.IngressVisibilityClusterLocal, v1alpha1.IngressVisibilityExternalIP} {
+		gateways, err := resources.GetGatewaysFromAnnotations(ing, visibility)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get %s gateways from annotation: %w", visibility, err)
+		}
+
+		// Ensure all gateways are known in the configuration
+		unknownGateways := gateways.Difference(ret[visibility])
+		if unknownGateways.Len() > 0 {
+			return nil, fmt.Errorf("following qualified name(s) aren't defined in the configuration (%s): %v", visibility, unknownGateways.List())
+		}
+
+		// If ingress specifies gateways, restrict to them
+		if gateways.Len() > 0 {
+			ret[visibility] = gateways
+		}
+	}
+
+	return ret, nil
 }

@@ -18,6 +18,7 @@ package resources
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/adler32"
 	"regexp"
@@ -45,6 +46,11 @@ const (
 	GatewayHTTPPort       = 80
 	dns1123LabelMaxLength = 63 // Public for testing only.
 	dns1123LabelFmt       = "[a-zA-Z0-9](?:[-a-zA-Z0-9]*[a-zA-Z0-9])?"
+
+	// Ingress annotation to select gateways
+	// public for testing purposes
+	PublicGatewayAnnotation = "serving.knative.dev/istio-gateways"
+	LocalGatewaysAnnotation = "serving.knative.dev/istio-local-gateways"
 )
 
 var httpServerPortName = "http-server"
@@ -110,7 +116,7 @@ func MakeIngressTLSGateways(ctx context.Context, ing *v1alpha1.Ingress, ingressT
 	if len(ingressTLS) == 0 {
 		return []*v1beta1.Gateway{}, nil
 	}
-	gatewayServices, err := getGatewayServices(ctx, svcLister)
+	gatewayServices, err := getGatewayServices(ctx, ing, svcLister)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +133,7 @@ func MakeIngressTLSGateways(ctx context.Context, ing *v1alpha1.Ingress, ingressT
 
 // MakeIngressGateways creates Gateways with given Servers for a given Ingress.
 func MakeIngressGateways(ctx context.Context, ing *v1alpha1.Ingress, servers []*istiov1beta1.Server, svcLister corev1listers.ServiceLister) ([]*v1beta1.Gateway, error) {
-	gatewayServices, err := getGatewayServices(ctx, svcLister)
+	gatewayServices, err := getGatewayServices(ctx, ing, svcLister)
 	if err != nil {
 		return nil, err
 	}
@@ -143,12 +149,12 @@ func MakeIngressGateways(ctx context.Context, ing *v1alpha1.Ingress, servers []*
 
 // MakeWildcardTLSGateways creates gateways that only contain TLS server with wildcard hosts based on the wildcard secret information.
 // For each public ingress service, we will create a list of Gateways. Each Gateway of the list corresponds to a wildcard cert secret.
-func MakeWildcardTLSGateways(ctx context.Context, originWildcardSecrets map[string]*corev1.Secret,
+func MakeWildcardTLSGateways(ctx context.Context, ing *v1alpha1.Ingress, originWildcardSecrets map[string]*corev1.Secret,
 	svcLister corev1listers.ServiceLister) ([]*v1beta1.Gateway, error) {
 	if len(originWildcardSecrets) == 0 {
 		return []*v1beta1.Gateway{}, nil
 	}
-	gatewayServices, err := getGatewayServices(ctx, svcLister)
+	gatewayServices, err := getGatewayServices(ctx, ing, svcLister)
 	if err != nil {
 		return nil, err
 	}
@@ -262,19 +268,32 @@ func makeIngressGateway(ing *v1alpha1.Ingress, selector map[string]string, serve
 	}
 }
 
-func getGatewayServices(ctx context.Context, svcLister corev1listers.ServiceLister) ([]*corev1.Service, error) {
-	ingressSvcMetas, err := GetIngressGatewaySvcNameNamespaces(ctx)
+func getGatewayServices(ctx context.Context, ing *v1alpha1.Ingress, svcLister corev1listers.ServiceLister) ([]*corev1.Service, error) {
+	restrictedGateways, err := GetGatewaysFromAnnotations(ing, v1alpha1.IngressVisibilityExternalIP)
 	if err != nil {
 		return nil, err
 	}
+
+	filter := FilterOption{}
+	if restrictedGateways.Len() > 0 {
+		filter.QualifiedNames = &restrictedGateways
+	}
+
+	ingressSvcMetas, err := GetSelectedIngressGatewaySvcNameNamespaces(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
 	services := make([]*corev1.Service, len(ingressSvcMetas))
 	for i, ingressSvcMeta := range ingressSvcMetas {
 		svc, err := svcLister.Services(ingressSvcMeta.Namespace).Get(ingressSvcMeta.Name)
 		if err != nil {
 			return nil, err
 		}
+
 		services[i] = svc
 	}
+
 	return services, nil
 }
 
@@ -379,21 +398,66 @@ func GetNonWildcardIngressTLS(ingressTLS []v1alpha1.IngressTLS, nonWildcardSecre
 }
 
 // GetIngressGatewaySvcNameNamespaces gets the Istio ingress namespaces from ConfigMap.
-// TODO(nghia):  Remove this by parsing at config parsing time.
 func GetIngressGatewaySvcNameNamespaces(ctx context.Context) ([]metav1.ObjectMeta, error) {
+	return getSelectedIngressGatewaySvcNameNamespaces(ctx, FilterOption{})
+}
+
+type FilterOption struct {
+	QualifiedNames *sets.String
+}
+
+// GetSelectedIngressGatewaySvcNameNamespaces gets the Istio ingress namespaces from ConfigMap for gateways which qualified name is in the list.
+func GetSelectedIngressGatewaySvcNameNamespaces(ctx context.Context, filter FilterOption) ([]metav1.ObjectMeta, error) {
+	return getSelectedIngressGatewaySvcNameNamespaces(ctx, filter)
+}
+
+func getSelectedIngressGatewaySvcNameNamespaces(ctx context.Context, filter FilterOption) ([]metav1.ObjectMeta, error) {
 	cfg := config.FromContext(ctx).Istio
-	nameNamespaces := make([]metav1.ObjectMeta, len(cfg.IngressGateways))
-	for i, ingressgateway := range cfg.IngressGateways {
-		parts := strings.SplitN(ingressgateway.ServiceURL, ".", 3)
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("unexpected service URL form: %s", ingressgateway.ServiceURL)
+
+	// If there is a filter, ensure all names are known in the config
+	if filter.QualifiedNames != nil {
+		knownNames := sets.NewString()
+		for _, ingressgateway := range cfg.IngressGateways {
+			knownNames.Insert(ingressgateway.QualifiedName())
 		}
-		nameNamespaces[i] = metav1.ObjectMeta{
-			Name:      parts[0],
-			Namespace: parts[1],
+
+		unknownGateways := filter.QualifiedNames.Difference(knownNames)
+		if unknownGateways.Len() > 0 {
+			return nil, fmt.Errorf("following qualified name(s) aren't defined in the configuration: %v", unknownGateways.List())
 		}
 	}
+
+	nameNamespaces := make([]metav1.ObjectMeta, 0, len(cfg.IngressGateways))
+
+	for _, ingressgateway := range cfg.IngressGateways {
+		if filter.QualifiedNames != nil && !filter.QualifiedNames.Has(ingressgateway.QualifiedName()) {
+			continue
+		}
+
+		meta, err := parseIngressGatewayConfig(ingressgateway)
+		if err != nil {
+			return nil, err
+		}
+
+		nameNamespaces = append(nameNamespaces, meta)
+	}
+
 	return nameNamespaces, nil
+}
+
+// TODO(nghia):  Remove this by parsing at config parsing time.
+func parseIngressGatewayConfig(ingressgateway config.Gateway) (metav1.ObjectMeta, error) {
+	ret := metav1.ObjectMeta{}
+
+	parts := strings.SplitN(ingressgateway.ServiceURL, ".", 3)
+	if len(parts) != 3 {
+		return ret, fmt.Errorf("unexpected service URL form: %s", ingressgateway.ServiceURL)
+	}
+
+	ret.Name = parts[0]
+	ret.Namespace = parts[1]
+
+	return ret, nil
 }
 
 // UpdateGateway replaces the existing servers with the wanted servers.
@@ -427,4 +491,39 @@ func UpdateGateway(gateway *v1beta1.Gateway, want []*istiov1beta1.Server, existi
 
 func isPlaceHolderServer(server *istiov1beta1.Server) bool {
 	return cmp.Equal(server, &placeholderServer, protocmp.Transform())
+}
+
+var errUnexpectedVisibility = errors.New("unexpected visibility value")
+
+// GetGatewaysFromAnnotations extracts Gateways from ingress annotations.
+func GetGatewaysFromAnnotations(ing *v1alpha1.Ingress, visibility v1alpha1.IngressVisibility) (sets.String, error) {
+	annotation := ""
+
+	switch visibility {
+	case v1alpha1.IngressVisibilityClusterLocal:
+		annotation = LocalGatewaysAnnotation
+	case v1alpha1.IngressVisibilityExternalIP:
+		annotation = PublicGatewayAnnotation
+	default:
+		return nil, fmt.Errorf("unexpected visibility value: %s", visibility)
+	}
+
+	ret := sets.NewString()
+
+	filters, ok := ing.ObjectMeta.Annotations[annotation]
+	if !ok {
+		return ret, nil
+	}
+
+	for _, gtw := range strings.Split(filters, ",") {
+		qualifiedName := strings.TrimSpace(gtw)
+
+		if !strings.Contains(qualifiedName, "/") {
+			return nil, fmt.Errorf("values in %s should be qualified name ($namespace/$name), got: %s", annotation, qualifiedName)
+		}
+
+		ret.Insert(qualifiedName)
+	}
+
+	return ret, nil
 }
