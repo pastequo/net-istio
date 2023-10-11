@@ -1287,6 +1287,24 @@ func TestQualifiedGatewayNamesFromContext(t *testing.T) {
 			},
 		},
 		{
+			name: "Unknown exposition",
+			cfg: &config.Istio{
+				IngressGateways: []config.Gateway{
+					{Namespace: "ns1", Name: "gtw1", Expositions: sets.New[string]("expo1")},
+				},
+				LocalGateways: []config.Gateway{
+					{Namespace: "ns1", Name: "gtw2", Expositions: sets.New[string]("expo2")},
+				},
+			},
+			ingress: &v1alpha1.Ingress{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				ExpositionAnnotation: "unknown-value",
+			}}},
+			want: map[v1alpha1.IngressVisibility]sets.Set[string]{
+				v1alpha1.IngressVisibilityExternalIP:   sets.New[string](),
+				v1alpha1.IngressVisibilityClusterLocal: sets.New[string](),
+			},
+		},
+		{
 			name: "No annotation",
 			cfg: &config.Istio{
 				IngressGateways: []config.Gateway{
