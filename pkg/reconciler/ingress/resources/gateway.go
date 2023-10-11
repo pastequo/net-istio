@@ -389,7 +389,7 @@ func GetNonWildcardIngressTLS(ingressTLS []v1alpha1.IngressTLS, nonWildcardSecre
 func GetIngressGatewaySvcNameNamespaces(ctx context.Context, ing *v1alpha1.Ingress) ([]metav1.ObjectMeta, error) {
 	nameNamespaces := make([]metav1.ObjectMeta, 0)
 
-	serviceGateways := GatewaysFromContext(ctx, ing)
+	serviceGateways := gatewaysFromContext(ctx, ing)
 	servicePublicGateways, ok := serviceGateways[v1alpha1.IngressVisibilityExternalIP]
 	if !ok {
 		return nameNamespaces, nil
@@ -455,25 +455,11 @@ func isPlaceHolderServer(server *istiov1beta1.Server) bool {
 	return cmp.Equal(server, &placeholderServer, protocmp.Transform())
 }
 
-// GetExpositionFromAnnotation extracts exposition values from ingress annotations.
-func GetExpositionFromAnnotation(ing *v1alpha1.Ingress) sets.Set[string] {
-	ret := sets.New[string]()
-
-	filters, ok := ing.ObjectMeta.Annotations[ExpositionAnnotation]
-	if !ok {
-		return ret
-	}
-
-	ret = ret.Insert(strings.Split(filters, ",")...)
-
-	return ret
-}
-
-// QualifiedGatewayNamesFromContext get gateway names from context
+// QualifiedGatewayNamesFromContext get gateway names from context.
 func QualifiedGatewayNamesFromContext(ctx context.Context, ing *v1alpha1.Ingress) map[v1alpha1.IngressVisibility]sets.Set[string] {
 	ret := make(map[v1alpha1.IngressVisibility]sets.Set[string])
 
-	gateways := GatewaysFromContext(ctx, ing)
+	gateways := gatewaysFromContext(ctx, ing)
 
 	for _, visibility := range []v1alpha1.IngressVisibility{v1alpha1.IngressVisibilityClusterLocal, v1alpha1.IngressVisibilityExternalIP} {
 		ret[visibility] = sets.New[string]()
@@ -486,10 +472,32 @@ func QualifiedGatewayNamesFromContext(ctx context.Context, ing *v1alpha1.Ingress
 	return ret
 }
 
-func GatewaysFromContext(ctx context.Context, ing *v1alpha1.Ingress) map[v1alpha1.IngressVisibility][]config.Gateway {
+// getExpositionFromAnnotation extracts exposition values from ingress annotations.
+func getExpositionFromAnnotation(ing *v1alpha1.Ingress) sets.Set[string] {
+	ret := sets.New[string]()
+
+	filters, ok := ing.ObjectMeta.Annotations[ExpositionAnnotation]
+	if !ok {
+		return ret
+	}
+
+	for _, expo := range strings.Split(filters, ",") {
+		toAdd := strings.TrimSpace(expo)
+		if len(toAdd) == 0 {
+			continue
+		}
+
+		ret = ret.Insert(toAdd)
+	}
+
+	return ret
+}
+
+// gatewaysFromContext get gateways relevant to this ingress from context.
+func gatewaysFromContext(ctx context.Context, ing *v1alpha1.Ingress) map[v1alpha1.IngressVisibility][]config.Gateway {
 	ret := make(map[v1alpha1.IngressVisibility][]config.Gateway)
 
-	expositions := GetExpositionFromAnnotation(ing)
+	expositions := getExpositionFromAnnotation(ing)
 
 	istioConfig := config.FromContext(ctx).Istio
 
@@ -506,7 +514,7 @@ func filterGatewayFromList(gateways []config.Gateway, exposition sets.Set[string
 		gtw := gateways[i]
 
 		if exposition.Len() > 0 {
-			matchedExpositions := gtw.Exposition.Intersection(exposition)
+			matchedExpositions := gtw.Expositions.Intersection(exposition)
 			if matchedExpositions.Len() == 0 {
 				continue
 			}
@@ -527,7 +535,7 @@ func PrivateGatewayServiceURLFromContext(ctx context.Context, ing *v1alpha1.Ingr
 }
 
 func getGatewayServiceURLFromContext(ctx context.Context, ing *v1alpha1.Ingress, visibility v1alpha1.IngressVisibility) string {
-	allGateways := GatewaysFromContext(ctx, ing)
+	allGateways := gatewaysFromContext(ctx, ing)
 
 	gateways, ok := allGateways[visibility]
 	if ok && len(gateways) > 0 {

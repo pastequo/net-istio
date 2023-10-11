@@ -73,10 +73,10 @@ func defaultLocalGateways() []Gateway {
 
 // Gateway specifies the name of the Gateway and the K8s Service backing it.
 type Gateway struct {
-	Namespace  string
-	Name       string
-	ServiceURL string
-	Exposition sets.Set[string]
+	Namespace   string
+	Name        string
+	ServiceURL  string
+	Expositions sets.Set[string]
 }
 
 // QualifiedName returns gateway name in '{namespace}/{name}' format.
@@ -130,7 +130,7 @@ func parseGateways(configMap *corev1.ConfigMap, prefix string) ([]Gateway, error
 		}
 
 		if expositionKeys, ok := expositions[fmt.Sprintf("%s.%s", namespace, name)]; ok {
-			gateways[i].Exposition = expositionKeys
+			gateways[i].Expositions = expositionKeys
 		}
 	}
 	return gateways, nil
@@ -150,7 +150,18 @@ func parseExposition(configMap *corev1.ConfigMap) map[string]sets.Set[string] {
 			gatewayName = fmt.Sprintf("%s.%s", system.Namespace(), gatewayName)
 		}
 
-		ret[gatewayName] = sets.New(strings.Split(expositionKeys, ",")...)
+		expositions := strings.Split(expositionKeys, ",")
+		for _, expo := range expositions {
+			toAdd := strings.TrimSpace(expo)
+			if len(toAdd) == 0 {
+				continue
+			}
+			if _, ok := ret[gatewayName]; !ok {
+				ret[gatewayName] = sets.New[string]()
+			}
+
+			ret[gatewayName] = ret[gatewayName].Insert(toAdd)
+		}
 	}
 
 	return ret
